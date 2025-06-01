@@ -1,7 +1,7 @@
-BOT_TOKEN = '7769962116:AAGgQGzOiBbQ8115fjLSBayCQCiiJy7Ua4U'
+BOT_TOKEN = ''
 ADMIN_IDS = [
-    779850852,
-    547742823
+    
+    
 ]
 DOWNLOAD_DIR = './downloads'
 CPM_RATES = {
