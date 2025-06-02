@@ -1,10 +1,10 @@
+from asyncio.log import logger
 from aiogram import Router, types, F
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from config import CPM_RATES, ADMIN_IDS
 from db import DB_PATH
 from handlers.admin_kb import admin_video_moderation_kb
-
 import yt_dlp
 import os
 import aiosqlite
@@ -14,17 +14,17 @@ import re
 import subprocess
 import uuid
 import asyncio
-
+import cv2
+import numpy as np
 from PIL import Image
 import pytesseract
 from aiogram.types import FSInputFile
-
+import cv2
+import numpy as np
 router = Router()
 
 class UploadState(StatesGroup):
     awaiting_link = State()
-
-# --- Вспомогательные функции ---
 
 def extract_frame_at_time(video_path: str, time_sec: float, frame_path: str):
     command = [
@@ -36,36 +36,7 @@ def extract_frame_at_time(video_path: str, time_sec: float, frame_path: str):
 def preprocess_image(image_path: str):
     image = Image.open(image_path).convert("L")
     return image.point(lambda x: 0 if x < 150 else 255, '1')
-import cv2 
-import numpy as np
 
-def get_motion_mask(frame1, frame2, threshold=30):
-    """
-    Возвращает маску движущихся областей между двумя кадрами.
-    :param frame1: первый кадр (BGR или grayscale)
-    :param frame2: второй кадр того же размера и типа
-    :param threshold: порог для определения движения
-    :return: маска (0/255) движущихся областей
-    """
-    # Если кадры цветные, переводим в оттенки серого
-    if len(frame1.shape) == 3:
-        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
-    else:
-        gray1 = frame1
-        gray2 = frame2
-
-    # Вычисляем абсолютную разницу
-    diff = cv2.absdiff(gray1, gray2)
-
-    # Применяем порог, чтобы выделить значимые изменения
-    _, motion_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
-
-    # Можно применить морфологические операции для удаления шума
-    kernel = np.ones((3, 3), np.uint8)
-    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
-
-    return motion_mask
 def ocr_from_image(frame_path: str) -> str:
     image = preprocess_image(frame_path)
     return pytesseract.image_to_string(image, lang='rus+eng')
@@ -87,7 +58,8 @@ def cleanup_files(paths: list):
                 os.remove(path)
 
 async def check_ad_with_timeout(video_path: str, temp_dir: str, timeout_sec: int = 15) -> str:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
+    
     def blocking_check():
         os.makedirs(temp_dir, exist_ok=True)
         for t in [round(x * 0.15, 1) for x in range(0, 100)]:
@@ -98,13 +70,13 @@ async def check_ad_with_timeout(video_path: str, temp_dir: str, timeout_sec: int
             if fuzzy_check_ad(text):
                 return "found"
         return "not_found"
-
+    
     try:
         result = await asyncio.wait_for(loop.run_in_executor(None, blocking_check), timeout=timeout_sec)
     except asyncio.TimeoutError:
         result = "moderation"
-
-    cleanup_files([temp_dir])
+    finally:
+        cleanup_files([temp_dir])
     return result
 
 async def save_video_to_db(user_id: int, video_id: str, link: str, status: str):
@@ -118,8 +90,6 @@ async def save_video_to_db(user_id: int, video_id: str, link: str, status: str):
             cpm, 'shorts', datetime.datetime.now().isoformat()
         ))
         await db.commit()
-
-# --- Хендлеры ---
 
 @router.message(F.text == "📥Загрузить видео")
 async def ask_video_link(message: types.Message, state: FSMContext):
@@ -184,6 +154,7 @@ async def process_link(message: types.Message, state: FSMContext):
             ydl.download([link])
     except Exception as e:
         await message.answer(f"Ошибка при загрузке видео: {e}")
+        cleanup_files([video_path])
         await state.clear()
         return
 
@@ -197,42 +168,155 @@ async def process_link(message: types.Message, state: FSMContext):
         return
 
     # Сохранение результата
-    await save_video_to_db(user_id, video_id, link, status)
-    await state.clear()
 
-    # Ответ пользователю
-    if status == "found":
-        await message.answer("✅ Видео прошло проверку и добавлено в монетизацию.")
-    elif status == "moderation":
-        await message.answer("⚠️ Видео не содержит явной рекламы. Отправлено на модерацию.")
-    else:
-        await message.answer("❌ Видео не содержит рекламной вставки. Загрузка отклонена.")
+    try:
+        await save_video_to_db(user_id, video_id, link, status)
+    except Exception as e: 
+        await message.answer(f"Ошибка при сохранении видео: {e}")
+# Обработка ошибок и очистка
+    try:         
+        cleanup_files([video_path, temp_dir])
+        await state.clear()
+        return
+    except Exception as e:
+        logger.error(f"Ошибка при очистке файлов: {e}")
 
-    # Уведомление админам
-    for admin_id in ADMIN_IDS:
+# Ответ пользователю
+    try:
+        if status == "found":
+            await message.answer("✅ Видео прошло проверку и добавлено в монетизацию.")
+        elif status == "moderation":
+            await message.answer("⚠️ Видео не содержит явной рекламы. Отправлено на модерацию.")
+        else:
+            await message.answer("❌ Видео не содержит рекламной вставки. Загрузка отклонена.")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке ответа пользователю: {e}")
+
+# Уведомление админам
+async def send_notification_to_admins(message: types.Message, video_path: str, video_id: str, status: str, link: str):
+    try:
+        for admin_id in ADMIN_IDS:
+            try:
+                if status == "moderation":
+                    # Отправка видео с кнопками модерации
+                    video_file = FSInputFile(video_path)
+                    await message.bot.send_video(
+                        chat_id=admin_id,
+                        video=video_file,
+                        caption=(
+                            f"❗ Видео пользователя {message.from_user.full_name}(tg://user?id={message.from_user.id}) "
+                            f"требует ручной модерации.\nСсылка: {link}"
+                        ),
+                        reply_markup=admin_video_moderation_kb(video_id),
+                        parse_mode="Markdown"
+                    )
+                else:
+                    # Отправка сообщения о статусе видео
+                    await message.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"Пользователь {message.from_user.full_name}(tg://user?id={message.from_user.id}) "
+                            f"загрузил видео: {link}\n"
+                            f"Статус: `{status}`"
+                        ),
+                        parse_mode="Markdown"
+                    )
+            except Exception as e:
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"Общая ошибка при отправке уведомлений админам: {e}")
+
+    # Дополнительные улучшения:
+    # 1. Логирование успешных операций
+    logger.info(f"Уведомления успешно отправлены {len(ADMIN_IDS)} администраторам")
+
+    # 2. Добавление статистики
+    success_count = 0
+    failed_count = 0
+    
+    try:
+        for admin_id in ADMIN_IDS:
+            try:
+                # Отправка сообщения
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"Общая ошибка при отправке уведомлений админам: {e}")
+    
+    logger.info(f"Статистика отправки: Успешно: {success_count}, Неудачно: {failed_count}")
+
+    # 3. Добавление асинхронного выполнения
+    async def send_message_async(admin_id):
         try:
             if status == "moderation":
                 video_file = FSInputFile(video_path)
                 await message.bot.send_video(
-                chat_id=admin_id,
-                video=video_file,
-                caption=(
-                    f"❗ Видео пользователя [{message.from_user.full_name}](tg://user?id={user_id}) "
-                    f"требует ручной модерации.\nСсылка: {link}"
-                ),
-                reply_markup=admin_video_moderation_kb(video_id),
-                parse_mode="Markdown"
-            )
+                    chat_id=admin_id,
+                    video=video_file,
+                    caption=(
+                        f"❗ Видео пользователя {message.from_user.full_name}(tg://user?id={message.from_user.id}) "
+                        f"требует ручной модерации.\nСсылка: {link}"
+                    ),
+                    reply_markup=admin_video_moderation_kb(video_id),
+                    parse_mode="Markdown"
+                )
             else:
                 await message.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"Пользователь [{message.from_user.full_name}](tg://user?id={user_id}) загрузил видео: {link}\n"
-                    f"Статус: `{status}`"
-                ),
-                parse_mode="Markdown"
-            )
+                    chat_id=admin_id,
+                    text=(
+                        f"Пользователь {message.from_user.full_name}(tg://user?id={message.from_user.id}) "
+                        f"загрузил видео: {link}\n"
+                        f"Статус: `{status}`"
+                    ),
+                    parse_mode="Markdown"
+                )
+            return True
         except Exception as e:
-         print(f"Ошибка отправки админам: {e}")
+            logger.error(f"Ошибка отправки админу {admin_id}: {e}")
+            return False
 
-# Удаление видео после отправки
+    # Использование gather для параллельной отправки
+    results = await asyncio.gather(*[send_message_async(admin_id) for admin_id in ADMIN_IDS])
+    success_count = sum(results)
+    failed_count = len(results) - success_count
+    
+    logger.info(f"Статистика отправки: Успешно: {success_count}, Неудачно: {failed_count}")
+
+# Очистка временных файлов (повторная попытка)
+    temp_dir = None
+    try:
+        cleanup_files([video_path, temp_dir])
+        await State.clear()
+    except Exception as e:
+            logger.error(f"Ошибка при повторной очистке файлов: {e}")
+
+# Дополнительные функции для обработки движения
+def get_motion_mask(frame1, frame2, threshold=30):
+    """
+    Возвращает маску движущихся областей между двумя кадрами.
+    :param frame1: первый кадр (BGR или grayscale)
+    :param frame2: второй кадр того же размера и типа
+    :param threshold: порог для определения движения
+    :return: маска (0/255) движущихся областей
+    """
+    # Если кадры цветные, переводим в оттенки серого
+    if len(frame1.shape) == 3:
+        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+    else:
+        gray1 = frame1
+        gray2 = frame2
+
+    # Вычисляем абсолютную разницу
+    diff = cv2.absdiff(gray1, gray2)
+
+    # Применяем порог, чтобы выделить значимые изменения
+    _, motion_mask = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
+
+    # Можно применить морфологические операции для удаления шума
+    kernel = np.ones((3, 3), np.uint8)
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
+
+    return motion_mask

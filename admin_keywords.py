@@ -5,35 +5,40 @@ from config import ADMIN_IDS
 from admin_kb import keyword_menu_kb
 import aiosqlite
 from db import DB_PATH
-
+import logging
+logger = logging.getLogger(__name__)
 router = Router()
 
 class KeywordFSM(StatesGroup):
     awaiting_keyword_to_add = State()
     awaiting_keyword_to_remove = State()
 
-def ADMIN_IDS(user_id: int) -> bool:
+def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 @router.message(F.text == "Ключевые слова")
 async def show_keywords(message: types.Message):
-    if not ADMIN_IDS(message.from_user.id):
+    if not is_admin(message.from_user.id):
         return await message.answer("У вас нет доступа к этой команде.")
     
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT keyword FROM keywords ORDER BY keyword") as cursor:
-            rows = await cursor.fetchall()
-            keywords = [row[0] for row in rows]
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT keyword FROM keywords ORDER BY keyword") as cursor:
+                rows = await cursor.fetchall()
+                keywords = [row[0] for row in rows]
 
-    if keywords:
-        text = "Ключевые слова для рекламы:\n\n" + "\n".join(f"• {kw}" for kw in keywords)
-    else:
-        text = "Ключевых слов пока нет."
-    await message.answer(text, reply_markup=keyword_menu_kb)
+        if keywords:
+            text = "Ключевые слова для рекламы:\n\n" + "\n".join(f"• {kw}" for kw in keywords)
+        else:
+            text = "Ключевых слов пока нет."
+        await message.answer(text, reply_markup=keyword_menu_kb)
+    except Exception as e:
+        logger.error(f"Ошибка при получении ключевых слов: {e}")
+        await message.answer("Произошла ошибка при получении ключевых слов.")
 
 @router.message(F.text == "Добавить ключ")
 async def ask_keyword_to_add(message: types.Message, state: FSMContext):
-    if not ADMIN_IDS(message.from_user.id):
+    if not is_admin(message.from_user.id):
         return await message.answer("У вас нет доступа к этой команде.")
     await message.answer("Введите новое ключевое слово:")
     await state.set_state(KeywordFSM.awaiting_keyword_to_add)
